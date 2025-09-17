@@ -1,0 +1,768 @@
+# bronze_to_silver_latest_only.py  (Glue 4.x/5.x | Spark 3.3 | Python 3.10)
+# -*- coding: utf-8 -*-
+import sys, json, re, traceback, boto3, gzip
+from io import BytesIO, StringIO
+from urllib.parse import urlparse
+from typing import Dict, Tuple, List, Optional
+
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F, types as T
+
+# -----------------------
+# Args
+# -----------------------
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME",
+    "bronze_prefix",    # s3://<bucket>/bronze
+    "silver_prefix",    # s3://<bucket>/silver  OR  .../silver/fact_indicator_measure(_current)
+    "ingest_date",      # YYYY-MM-DD
+    "profile_filter",   # optional, "*" default (comma-separated profile keys when used)
+])
+
+def _opt_arg(name: str, default=None):
+    flag = f"--{name}"
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            val = (sys.argv[i+1] or "").strip()
+            return val if val else default
+    return default
+
+BRONZE_PREFIX = args["bronze_prefix"].rstrip("/")
+SILVER_FACT_PREFIX = args["silver_prefix"].rstrip("/")
+SILVER_BASE_PREFIX = SILVER_FACT_PREFIX.rsplit("/", 1)[0] if "/" in SILVER_FACT_PREFIX else SILVER_FACT_PREFIX
+INGEST_DATE = args["ingest_date"]
+PREV_DATE = _opt_arg("prev_date", None)
+PROFILE_FILTER = (args.get("profile_filter") or "*").strip()
+
+# Dest for CURRENT fact
+SILVER_FACT_CURRENT_PREFIX = (
+    SILVER_FACT_PREFIX
+    if SILVER_FACT_PREFIX.endswith("/fact_indicator_measure_current")
+    else f"{SILVER_BASE_PREFIX}/fact_indicator_measure_current"
+)
+
+# -----------------------
+# Spark / Glue
+# -----------------------
+spark = (
+    SparkSession.builder
+    .appName("bronze->silver (latest-only) fact_indicator_measure_current + dims_current")
+    .config("spark.sql.sources.partitionOverwriteMode", "dynamic")  # overwrite only written partitions
+    .config("spark.sql.files.maxRecordsPerFile", "2000000")
+    .config("spark.sql.session.timeZone", "UTC")
+    .getOrCreate()
+)
+glue_ctx = GlueContext(spark.sparkContext)
+logger = glue_ctx.get_logger()
+logger.info(
+    f"Job starting | bronze_prefix={BRONZE_PREFIX} | silver_base={SILVER_BASE_PREFIX} "
+    f"| fact_current={SILVER_FACT_CURRENT_PREFIX} | snapshot_date={INGEST_DATE} "
+    f"| prev_date={PREV_DATE or '(auto)'} | profile_filter={PROFILE_FILTER}"
+)
+
+s3 = boto3.client("s3")
+
+# -----------------------
+# Helpers
+# -----------------------
+def parse_s3(uri: str) -> Tuple[str, str]:
+    u = urlparse(uri)
+    return u.netloc, u.path.lstrip("/")
+
+def s3_list(bucket: str, prefix: str) -> List[str]:
+    prefix = (prefix or "").lstrip("/")
+    logger.info(f"[S3 LIST] bucket={bucket} prefix={prefix}")
+    keys, token, n = [], None, 0
+    while True:
+        kw = dict(Bucket=bucket, Prefix=prefix)
+        if token: kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        for it in resp.get("Contents", []) or []:
+            keys.append(it["Key"]); n += 1
+            if n % 2000 == 0:
+                logger.info(f"[S3 LIST] ...{n} keys so far")
+        token = resp.get("NextContinuationToken")
+        if not token: break
+    logger.info(f"[S3 LIST] total={len(keys)}")
+    return keys
+
+def s3_get_json(bucket: str, key: str) -> dict:
+    logger.info(f"[S3 GET] s3://{bucket}/{key}")
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    return json.loads(body.decode("utf-8"))
+
+def s3_peek_bytes(bucket: str, key: str, n: int = 2) -> bytes:
+    rng = f"bytes=0-{max(0,n-1)}"
+    resp = s3.get_object(Bucket=bucket, Key=key, Range=rng)
+    return resp["Body"].read()
+
+def _norm(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (s or "").lower())
+
+def _null_if_blank(col: F.Column) -> F.Column:
+    return (F.when(col.isNull(), F.lit(None))
+             .when(F.length(F.trim(col)) == 0, F.lit(None))
+             .otherwise(F.trim(col)))
+
+def _quote_ident(name: str) -> str:
+    return f"`{(name or '').replace('`', '``')}`"
+
+def _col_safe(raw_name: str) -> F.Column:
+    return F.expr(_quote_ident(raw_name))
+
+CANON = {
+    "indicator_id": ["Indicator ID","IndicatorID","indicator id","indicator_id","IndicatorId"],
+    "area_code": ["Area Code","AreaCode","area code","areacode"],
+    "area_name": ["Area Name","AreaName","area name"],
+    "parent_code": ["Parent Code","ParentCode","parent code"],
+    "parent_name": ["Parent Name","ParentName","parent name"],
+    "sex_key": ["Sex","sex"],
+    "age_key": ["Age","age"],
+    "category_type": ["Category Type","CategoryType","category type"],
+    "category_value": ["Category","category"],
+    "time_label": ["Time period","Time Period","time period","timeperiod"],
+    "time_sortable": ["Time period Sortable","Time Period Sortable","timeperiod sortable","Time_period_sortable"],
+    "value": ["Value","value"],
+    "lower_ci_95": ["Lower CI 95.0 limit","Lower CI (95.0%) limit","Lower CI 95 limit","Lower CI95.0 limit"],
+    "upper_ci_95": ["Upper CI 95.0 limit","Upper CI (95.0%) limit","Upper CI 95 limit","Upper CI95.0 limit"],
+    "count": ["Count","count"],
+    "denominator": ["Denominator","denominator"],
+    "recent_trend": ["Recent Trend","RecentTrend","recent trend"],
+    "comp_to_eng": ["Compared to England value or percentiles"],
+    "comp_to_region": ["Compared to regional value or percentiles"],
+    "value_note": ["Value note","Value Note","value note"],
+}
+
+# ---------- Indicator names from bronze metadata (no API) ----------
+def _pick_indicator_meta_key(target_date: str) -> Optional[str]:
+    bkt, meta_prefix = parse_s3(f"{BRONZE_PREFIX}/metadata/")
+    keys = s3_list(bkt, meta_prefix)
+    candidates = []
+    for k in keys:
+        if "indicator_metadata.csv" in k:  # matches .csv or .csv.gz
+            if "ingest_date=" in k:
+                d = k.split("ingest_date=")[1].split("/")[0]
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+                    candidates.append((d, k))
+    if not candidates:
+        logger.warn("[META] No indicator_metadata.* under bronze/metadata/")
+        return None
+    for (d, k) in candidates:
+        if d == target_date:
+            logger.info(f"[META] Using indicator metadata for exact date {d}")
+            return k
+    le = sorted([(d, k) for (d, k) in candidates if d <= target_date])
+    if le:
+        logger.info(f"[META] Using indicator metadata from latest ≤ {target_date}: {le[-1][0]}")
+        return le[-1][1]
+    latest = sorted(candidates)[-1][1]
+    logger.info("[META] Using latest available indicator metadata")
+    return latest
+
+def _read_meta_csv_resilient(uri: str) -> DataFrame:
+    """
+    Read indicator_metadata CSV (possibly .gz). If Spark's CSV reader fails with
+    a gzip error, fall back to boto3+python CSV and create a small DataFrame.
+    """
+    try:
+        return spark.read.option("header","true").csv(uri)
+    except Exception as e:
+        msg = str(e).lower()
+        if "incorrect header check" not in msg and "not in gzip format" not in msg:
+            raise
+        # Fallback: download and parse locally
+        bkt, key = parse_s3(uri)
+        logger.warn(f"[META] Spark gzip read failed for {uri}. Falling back to boto3 parse …")
+        body = s3.get_object(Bucket=bkt, Key=key)["Body"].read()
+        if key.endswith(".gz"):
+            try:
+                body = gzip.decompress(body)
+            except Exception as e2:
+                logger.error(f"[META] boto3 decompress failed for {uri}: {e2}")
+                raise
+        text = body.decode("utf-8", errors="replace")
+        rows = []
+        import csv as _csv
+        rdr = _csv.DictReader(StringIO(text))
+        for r in rdr:
+            rows.append(r)
+        if not rows:
+            # return empty 2-col frame
+            return spark.createDataFrame([], schema=T.StructType([
+                T.StructField("Indicator ID", T.StringType()),
+                T.StructField("Indicator Name", T.StringType()),
+            ]))
+        # Infer schema from first row keys
+        cols = list(rows[0].keys())
+        pdf = spark.createDataFrame(rows)  # small; ok
+        return pdf
+
+def load_indicator_meta_map() -> Optional[DataFrame]:
+    """
+    Build an indicator lookup (id, name, definition) from bronze metadata.
+
+    Column priority:
+      - Name:        "Indicator"  → "Indicator Name" → "Name" → "Simple Name"
+      - Definition:  "Definition" → "Indicator Definition" → "Simple Definition"
+    """
+    bkt, _ = parse_s3(BRONZE_PREFIX)
+    key = _pick_indicator_meta_key(INGEST_DATE)
+    if not key:
+        return None
+
+    uri = f"s3://{bkt}/{key}"
+    logger.info(f"[META] Reading indicator metadata: {uri}")
+
+    # Read (resilient to mislabeled .gz)
+    if key.endswith(".gz"):
+        try:
+            head2 = s3_peek_bytes(bkt, key, 2)
+            if head2 != b"\x1f\x8b":
+                logger.warn(f"[META] {uri} endswith .gz but not gzip (magic={head2!r}); using resilient reader.")
+                meta_raw = _read_meta_csv_resilient(uri)
+            else:
+                meta_raw = spark.read.option("header","true").csv(uri)
+        except Exception:
+            meta_raw = _read_meta_csv_resilient(uri)
+    else:
+        meta_raw = _read_meta_csv_resilient(uri)
+
+    cols = meta_raw.columns
+
+    def _choose(cols: List[str], cands: List[str]) -> Optional[str]:
+        # exact-ish normalize match first
+        nmap = {_norm(c): c for c in cols}
+        for c in cands:
+            if _norm(c) in nmap:
+                return nmap[_norm(c)]
+        # loose fallback: pick first column containing the last keyword
+        if cands:
+            kw = (cands[-1] or "").lower()
+            for c in cols:
+                if kw and kw in (c or "").lower():
+                    return c
+        return None
+
+    # REQUIRED: id
+    id_col = _choose(cols, ["Indicator ID","IndicatorID","IndicatorId","Id","indicator id"])
+    if not id_col:
+        logger.warn("[META] Missing indicator id column in metadata; skipping names/definitions.")
+        return None
+
+    # Name/title columns — prefer "Indicator" then "Indicator Name", then "Name", then "Simple Name"
+    title_col        = _choose(cols, ["Indicator","Indicator Name","IndicatorName","Name"])
+    simple_name_col  = _choose(cols, ["Simple Name","SimpleName"])
+
+    # Definition columns — prefer long "Definition"/"Indicator Definition", then "Simple Definition"
+    def_long_col     = _choose(cols, ["Definition","Indicator Definition","IndicatorDefinition"])
+    def_simple_col   = _choose(cols, ["Simple Definition","SimpleDefinition"])
+
+    def _trim_or_null(colname: Optional[str]) -> F.Column:
+        if not colname:
+            return F.lit(None)
+        return (
+            F.when(F.col(colname).isNull(), F.lit(None))
+             .otherwise(
+                 F.when(F.length(F.trim(F.col(colname))) == 0, F.lit(None))
+                  .otherwise(F.trim(F.col(colname)))
+             )
+        )
+
+    meta = (
+        meta_raw
+        .select(
+            _col_safe(id_col).alias("indicator_id_str"),
+            (_col_safe(title_col)       if title_col       else F.lit(None)).alias("title_raw"),
+            (_col_safe(simple_name_col) if simple_name_col else F.lit(None)).alias("simple_name_raw"),
+            (_col_safe(def_long_col)    if def_long_col    else F.lit(None)).alias("def_long_raw"),
+            (_col_safe(def_simple_col)  if def_simple_col  else F.lit(None)).alias("def_simple_raw"),
+        )
+        .withColumn(
+            "indicator_id",
+            F.when(
+                F.regexp_replace("indicator_id_str", r"\s","").rlike(r"^\d+$"),
+                F.regexp_replace("indicator_id_str", r"\s","").cast("int"),
+            ).otherwise(F.lit(None).cast("int"))
+        )
+        .withColumn(
+            "indicator_name",
+            F.coalesce(_trim_or_null("title_raw"), _trim_or_null("simple_name_raw")).cast("string")
+        )
+        .withColumn(
+            "indicator_definition",
+            F.coalesce(_trim_or_null("def_long_raw"), _trim_or_null("def_simple_raw")).cast("string")
+        )
+        .drop("indicator_id_str","title_raw","simple_name_raw","def_long_raw","def_simple_raw")
+        .where(F.col("indicator_id").isNotNull())
+        .groupBy("indicator_id")
+        .agg(
+            F.first("indicator_name", ignorenulls=True).alias("indicator_name"),
+            F.first("indicator_definition", ignorenulls=True).alias("indicator_definition"),
+        )
+    )
+
+    logger.info(f"[META] Indicator rows loaded (name/definition): {meta.count()}")
+    return meta
+
+# ---------- Bronze index & task planning ----------
+def build_bronze_index(date_str: str) -> Dict[Tuple[str,int], dict]:
+    if not date_str:
+        return {}
+    bkt, data_key_prefix = parse_s3(f"{BRONZE_PREFIX}/data/")
+    keys = s3_list(bkt, data_key_prefix)
+    out: Dict[Tuple[str,int], dict] = {}
+    date_marker = f"ingest_date={date_str}/"
+    for key in keys:
+        if date_marker not in key: 
+            continue
+        if not (key.endswith("/_meta.json") or key.endswith("/all_data_by_profile.csv.gz")):
+            continue
+        parts = key.split("/")
+        try:
+            pkey = [p.split("=",1)[1] for p in parts if p.startswith("profile_key=")][0]
+            atid = int([p.split("=",1)[1] for p in parts if p.startswith("area_type_id=")][0])
+        except Exception:
+            logger.warn(f"[INDEX] Skip unexpected path: s3://{bkt}/{key}")
+            continue
+        k = (pkey, atid)
+        cur = out.setdefault(k, {"csv": None, "meta": None, "empty": False, "sha": None})
+        if key.endswith("/_meta.json"):
+            cur["meta"] = f"s3://{bkt}/{key}"
+            try:
+                js = s3_get_json(bkt, key)
+                cur["empty"] = bool(js.get("empty", False))
+                cur["sha"] = js.get("sha256_uncompressed")
+                csv_name = js.get("file", "all_data_by_profile.csv.gz")
+                csv_key = "/".join(key.split("/")[:-1] + [csv_name])
+                cur["csv"] = f"s3://{bkt}/{csv_key}"
+            except Exception as e:
+                logger.warn(f"[INDEX] Failed to read meta {key}: {e}")
+        else:
+            cur["csv"] = f"s3://{bkt}/{key}"
+    logger.info(f"[INDEX] built for date={date_str} items={len(out)}")
+    return out
+
+def choose_tasks(curr_idx: Dict, prev_idx: Dict) -> List[Tuple[str,int,str]]:
+    tasks = []
+    for (pkey, atid), cur in curr_idx.items():
+        if cur.get("empty"):
+            continue
+        prev = prev_idx.get((pkey, atid)) if prev_idx else None
+        cur_sha, prev_sha = cur.get("sha"), (prev or {}).get("sha")
+        if (prev is None) or (prev and prev.get("empty")):
+            tasks.append((pkey, atid, cur["csv"]))
+        else:
+            if (cur_sha and prev_sha and cur_sha != prev_sha) or (cur_sha is None):
+                tasks.append((pkey, atid, cur["csv"]))
+
+    if PROFILE_FILTER != "*":
+        wanted = {x.strip() for x in PROFILE_FILTER.split(",") if x.strip()}
+        tasks = [t for t in tasks if t[0] in wanted]
+
+    logger.info(f"[TASKS] selected={len(tasks)}")
+    if tasks[:5]:
+        logger.info(f"[TASKS] sample={tasks[:5]}")
+    return tasks
+
+# ---------- CSV reading / canonicalization ----------
+def _choose_column(cols: List[str], cands: List[str]) -> Optional[str]:
+    nmap = {_norm(c): c for c in cols}
+    for c in cands:
+        if _norm(c) in nmap:
+            return nmap[_norm(c)]
+    return None
+
+def _preflight_gzip(uri: str):
+    if not uri.endswith(".gz"):
+        return
+    bkt, key = parse_s3(uri)
+    head2 = s3_peek_bytes(bkt, key, 2)
+    if head2 != b"\x1f\x8b":
+        raise RuntimeError(f"File claims .gz but magic bytes are {head2!r} (s3://{bkt}/{key})")
+
+def read_csv_canonical(s3_csv_uri: str) -> DataFrame:
+    logger.info(f"[READ] {s3_csv_uri}")
+    # Preflight to avoid Spark gzip codec crash on mislabeled objects
+    try:
+        _preflight_gzip(s3_csv_uri)
+    except Exception as e:
+        raise RuntimeError(f"incorrect header check (preflight): {e}")
+
+    df = (spark.read
+        .option("header", "true")
+        .option("multiLine", "false")
+        .option("escape", '"')
+        .csv(s3_csv_uri))
+    logger.info(f"[READ] schema={df.schema.simpleString()}")
+    logger.info(f"[READ] columns={df.columns}")
+
+    cols = df.columns
+    sel: Dict[str, Optional[str]] = {}
+    for k, cands in CANON.items():
+        got = _choose_column(cols, cands)
+        if not got and k in ("comp_to_eng","comp_to_region"):
+            for c in cols:
+                cl = (c or "").lower()
+                if "compared" in cl and (("england" in cl and k=="comp_to_eng") or ("regional" in cl and k=="comp_to_region")):
+                    got = c; break
+        sel[k] = got
+
+    logger.info("[MAP] canonical->source = " + json.dumps(sel, ensure_ascii=False))
+
+    def col_or_null(key: str):
+        src = sel.get(key)
+        return _col_safe(src).cast("string") if src else F.lit(None).cast("string")
+
+    df2 = df.select(
+        col_or_null("indicator_id").alias("indicator_id"),
+        col_or_null("area_code").alias("area_code"),
+        col_or_null("area_name").alias("area_name"),
+        col_or_null("parent_code").alias("parent_code"),
+        col_or_null("parent_name").alias("parent_name"),
+        col_or_null("sex_key").alias("sex_key"),
+        col_or_null("age_key").alias("age_key"),
+        col_or_null("category_type").alias("category_type"),
+        col_or_null("category_value").alias("category_value"),
+        col_or_null("time_label").alias("time_label"),
+        col_or_null("time_sortable").alias("time_sortable"),
+        col_or_null("value").alias("value"),
+        col_or_null("lower_ci_95").alias("lower_ci_95"),
+        col_or_null("upper_ci_95").alias("upper_ci_95"),
+        col_or_null("count").alias("count"),
+        col_or_null("denominator").alias("denominator"),
+        col_or_null("recent_trend").alias("recent_trend"),
+        col_or_null("comp_to_eng").alias("comp_to_eng"),
+        col_or_null("comp_to_region").alias("comp_to_region"),
+        col_or_null("value_note").alias("value_note"),
+    )
+
+    # Trim -> null
+    for c in [
+        "area_code","area_name","parent_code","parent_name",
+        "sex_key","age_key","category_type","category_value",
+        "time_label","recent_trend","comp_to_eng","comp_to_region","value_note"
+    ]:
+        df2 = df2.withColumn(c, _null_if_blank(F.col(c)))
+
+    # Casts
+    def to_int_col(c):
+        cleaned = F.regexp_replace(F.col(c), r"\s", "")
+        return F.when(cleaned.rlike(r"^-?\d+$"), cleaned.cast("int")).otherwise(F.lit(None).cast("int"))
+    def to_double_col(c):
+        cleaned = F.regexp_replace(F.col(c), ",", "")
+        return F.when(cleaned.rlike(r"^-?\d+(\.\d+)?([eE]-?\d+)?$"), cleaned.cast("double")).otherwise(F.lit(None).cast("double"))
+
+    df3 = (df2
+        .withColumn("indicator_id", to_int_col("indicator_id"))
+        .withColumn("time_sortable", to_int_col("time_sortable"))
+        .withColumn("value", to_double_col("value"))
+        .withColumn("lower_ci_95", to_double_col("lower_ci_95"))
+        .withColumn("upper_ci_95", to_double_col("upper_ci_95"))
+        .withColumn("count", to_double_col("count"))
+        .withColumn("denominator", to_double_col("denominator"))
+    )
+
+    # Fix mis-map: numeric area_code equals time_sortable
+    df3 = (df3
+        .withColumn(
+            "area_code",
+            F.when(
+                (F.col("area_code").rlike(r"^\d{7,9}$")) &
+                (F.col("time_sortable").isNotNull()) &
+                (F.col("area_code") == F.col("time_sortable").cast("string")),
+                F.lit(None).cast("string")
+            ).otherwise(F.col("area_code"))
+        )
+        .withColumn("area_name", F.when(F.col("area_code").isNull(), F.lit(None).cast("string")).otherwise(F.col("area_name")))
+        .withColumn("parent_code", F.when(F.col("area_code").isNull(), F.lit(None).cast("string")).otherwise(F.col("parent_code")))
+        .withColumn("parent_name", F.when(F.col("area_code").isNull(), F.lit(None).cast("string")).otherwise(F.col("parent_name")))
+    )
+
+    before_clean = df3.count()
+    df3 = df3.where(
+        F.col("indicator_id").isNotNull() &
+        F.col("area_code").isNotNull() &
+        F.col("time_sortable").isNotNull()
+    )
+    after_clean = df3.count()
+    logger.info(f"[READ] dropped_blank_rows={before_clean - after_clean} | kept_rows={after_clean}")
+
+    if after_clean > 0:
+        sample = df3.limit(3).toJSON().collect()
+        logger.info(f"[READ] sample_rows={sample}")
+
+    return df3
+
+def _empty_fact_schema() -> T.StructType:
+    return T.StructType([
+        T.StructField("indicator_id", T.IntegerType()),
+        T.StructField("area_code", T.StringType()),
+        T.StructField("area_name", T.StringType()),
+        T.StructField("parent_code", T.StringType()),
+        T.StructField("parent_name", T.StringType()),
+        T.StructField("sex_key", T.StringType()),
+        T.StructField("age_key", T.StringType()),
+        T.StructField("category_type", T.StringType()),
+        T.StructField("category_value", T.StringType()),
+        T.StructField("time_label", T.StringType()),
+        T.StructField("time_sortable", T.IntegerType()),
+        T.StructField("value", T.DoubleType()),
+        T.StructField("lower_ci_95", T.DoubleType()),
+        T.StructField("upper_ci_95", T.DoubleType()),
+        T.StructField("count", T.DoubleType()),
+        T.StructField("denominator", T.DoubleType()),
+        T.StructField("recent_trend", T.StringType()),
+        T.StructField("comp_to_eng", T.StringType()),
+        T.StructField("comp_to_region", T.StringType()),
+        T.StructField("value_note", T.StringType()),
+    ])
+
+def transform_one(s3_csv_uri: str, profile_key: str, area_type_id: int) -> DataFrame:
+    df = read_csv_canonical(s3_csv_uri)
+    is_empty = df.rdd.isEmpty()
+    logger.info(f"[XFORM] {profile_key}/{area_type_id} | empty_after_clean={is_empty}")
+    if is_empty:
+        df = spark.createDataFrame([], _empty_fact_schema())
+    df = (df
+          .withColumn("profile_key", F.lit(profile_key))
+          .withColumn("area_type_id", F.lit(int(area_type_id)).cast("int"))
+          .withColumn("snapshot_date", F.lit(INGEST_DATE)))
+    # Natural-key de-dup
+    keys = ["indicator_id","area_code","sex_key","age_key","category_type","category_value","time_sortable"]
+    before = df.count()
+    df = df.dropDuplicates(keys)
+    after = df.count()
+    logger.info(f"[XFORM] {profile_key}/{area_type_id} | dedup {before}->{after}")
+    return df
+
+# -----------------------
+# Plan tasks
+# -----------------------
+curr_idx = build_bronze_index(INGEST_DATE)
+
+if PREV_DATE is None:
+    bkt, bronze_key_prefix = parse_s3(BRONZE_PREFIX)
+    logger.info("[PREV] auto-detecting previous date under bronze/")
+    dates = set()
+    for key in s3_list(bkt, bronze_key_prefix):
+        if "/data/" in key and "ingest_date=" in key:
+            d = key.split("ingest_date=")[1].split("/")[0]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d < INGEST_DATE:
+                dates.add(d)
+    PREV_DATE = sorted(dates)[-1] if dates else None
+    logger.info(f"[PREV] detected prev_date={PREV_DATE or '(none)'}")
+
+prev_idx = build_bronze_index(PREV_DATE) if PREV_DATE else {}
+tasks = choose_tasks(curr_idx, prev_idx)
+empties_today = [(pkey, atid) for (pkey, atid), cur in curr_idx.items() if cur.get("empty")]
+
+logger.info(f"[PLAN] Bronze pairs today={len(curr_idx)} | tasks={len(tasks)} | empties_today={len(empties_today)}")
+if not tasks and not empties_today:
+    logger.info("[PLAN] Nothing to do; exiting.")
+    sys.exit(0)
+
+# -----------------------
+# Transform & union (ONLY tasks — changed/new pairs)
+# -----------------------
+dfs: List[DataFrame] = []
+for (pkey, atid, csv_uri) in tasks:
+    logger.info(f"[XFORM] START {pkey} | area_type_id={atid} | {csv_uri}")
+    try:
+        dfi = transform_one(csv_uri, pkey, atid)
+        cnt = dfi.count()
+        logger.info(f"[XFORM] DONE {pkey}/{atid} | rows={cnt}")
+        dfs.append(dfi)
+    except Exception as e:
+        logger.error(f"[XFORM] FAILED {pkey}/{atid}: {e}\n{traceback.format_exc()}")
+
+if dfs:
+    logger.info(f"[UNION] Unioning {len(dfs)} DataFrames ...")
+    fact_df_changed = dfs[0]
+    for d in dfs[1:]:
+        fact_df_changed = fact_df_changed.unionByName(d, allowMissingColumns=True)
+    changed_rows = fact_df_changed.count()
+else:
+    fact_df_changed = (spark.createDataFrame([], _empty_fact_schema())
+                       .withColumn("profile_key", F.lit(None).cast("string"))
+                       .withColumn("area_type_id", F.lit(None).cast("int"))
+                       .withColumn("snapshot_date", F.lit(INGEST_DATE)))
+    changed_rows = 0
+
+logger.info(f"[UNION] Rows to write into CURRENT={changed_rows}")
+
+# -----------------------
+# Write FACT CURRENT (latest-only; partitioned by profile_key, area_type_id)
+# -----------------------
+if changed_rows > 0:
+    logger.info(f"[WRITE:FACT_CURRENT] → {SILVER_FACT_CURRENT_PREFIX}")
+    (fact_df_changed
+        .repartition("profile_key","area_type_id")
+        .write
+        .mode("overwrite")  # dynamic overwrite for just these partitions
+        .format("parquet")
+        .option("compression","snappy")
+        .partitionBy("profile_key","area_type_id")
+        .save(SILVER_FACT_CURRENT_PREFIX))
+else:
+    logger.info("[WRITE:FACT_CURRENT] No changed partitions to write.")
+
+# -----------------------
+# Drop CURRENT partitions that became EMPTY today
+# -----------------------
+def drop_current_partition(profile_key: str, area_type_id: int):
+    bkt, key_prefix = parse_s3(SILVER_FACT_CURRENT_PREFIX)
+    part_prefix = f"{key_prefix.rstrip('/')}/profile_key={profile_key}/area_type_id={area_type_id}/"
+    token = None
+    to_delete = []
+    while True:
+        kw = dict(Bucket=bkt, Prefix=part_prefix)
+        if token: kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        objs = [{"Key": it["Key"]} for it in resp.get("Contents", []) or []]
+        if objs:
+            to_delete.extend(objs)
+            if len(to_delete) >= 1000:
+                s3.delete_objects(Bucket=bkt, Delete={"Objects": to_delete})
+                to_delete = []
+        token = resp.get("NextContinuationToken")
+        if not token: break
+    if to_delete:
+        s3.delete_objects(Bucket=bkt, Delete={"Objects": to_delete})
+    logger.info(f"[CURRENT][DROP] {profile_key}/{area_type_id} removed")
+
+for (pkey, atid) in empties_today:
+    drop_current_partition(pkey, atid)
+
+# -----------------------
+# Write partition refresh log (append)
+# -----------------------
+log_rows = []
+for (pkey, atid, _csv) in tasks:
+    prev_sha = (prev_idx.get((pkey, atid)) or {}).get("sha")
+    curr_sha = (curr_idx.get((pkey, atid)) or {}).get("sha")
+    log_rows.append( (pkey, atid, "overwrite", prev_sha, curr_sha, INGEST_DATE) )
+for (pkey, atid) in empties_today:
+    prev_sha = (prev_idx.get((pkey, atid)) or {}).get("sha")
+    curr_sha = (curr_idx.get((pkey, atid)) or {}).get("sha")
+    log_rows.append( (pkey, atid, "drop", prev_sha, curr_sha, INGEST_DATE) )
+
+if log_rows:
+    schema = T.StructType([
+        T.StructField("profile_key", T.StringType()),
+        T.StructField("area_type_id", T.IntegerType()),
+        T.StructField("action", T.StringType()),           # overwrite | drop
+        T.StructField("prev_sha", T.StringType()),
+        T.StructField("curr_sha", T.StringType()),
+        T.StructField("snapshot_date", T.StringType()),
+    ])
+    log_df = spark.createDataFrame(log_rows, schema=schema)
+    path_log = f"{SILVER_BASE_PREFIX}/partition_refresh_log"
+    (log_df
+        .write
+        .mode("append")
+        .format("parquet")
+        .partitionBy("snapshot_date")
+        .save(path_log))
+    logger.info(f"[LOG] appended {len(log_rows)} rows to {path_log}")
+else:
+    logger.info("[LOG] no changes to log")
+
+# -----------------------
+# Build & Write CURRENT DIMENSIONS (recompute from full current fact)
+# -----------------------
+# Read the full current fact (after this run's writes/deletes)
+fact_cur_path = SILVER_FACT_CURRENT_PREFIX
+try:
+    fact_cur = spark.read.parquet(fact_cur_path)
+except Exception:
+    # No data yet (first run with only drops)
+    fact_cur = (spark.createDataFrame([], _empty_fact_schema())
+                .withColumn("profile_key", F.lit(None).cast("string"))
+                .withColumn("area_type_id", F.lit(None).cast("int"))
+                .withColumn("snapshot_date", F.lit(INGEST_DATE)))
+
+def write_dim_current(df: DataFrame, name: str):
+    path = f"{SILVER_BASE_PREFIX}/{name}_current"
+    rows = df.count()
+    logger.info(f"[WRITE:{name}_current] rows={rows} path={path}")
+    (df.write.mode("overwrite").format("parquet").option("compression","snappy").save(path))
+    logger.info(f"[WRITE:{name}_current] done")
+
+# Keep only needed columns to reduce IO for dims (include area_type_id)
+fact_cur_small = (fact_cur
+    .select("indicator_id","area_code","area_name","parent_code","parent_name",
+            "sex_key","age_key","category_type","category_value",
+            "time_label","time_sortable","profile_key","area_type_id"))
+
+# dim_area_current
+dim_area_current = (fact_cur_small
+    .select("area_code","area_type_id","area_name","parent_code","parent_name")
+    .where(F.col("area_code").isNotNull() & ~F.col("area_code").rlike(r"^\d{7,9}$"))
+    .dropDuplicates(["area_code","area_type_id"]))
+write_dim_current(dim_area_current, "dim_area")
+
+# dim_time_current
+dim_time_current = (fact_cur_small
+    .select("time_sortable","time_label")
+    .where(F.col("time_sortable").isNotNull() | F.col("time_label").isNotNull())
+    .dropDuplicates(["time_sortable","time_label"]))
+write_dim_current(dim_time_current, "dim_time")
+
+# dim_category_current
+dim_category_current = (fact_cur_small
+    .select("category_type","category_value")
+    .where(F.col("category_type").isNotNull() | F.col("category_value").isNotNull())
+    .dropDuplicates(["category_type","category_value"]))
+write_dim_current(dim_category_current, "dim_category")
+
+# dim_sex_current
+dim_sex_current = (fact_cur_small
+    .select("sex_key").where(F.col("sex_key").isNotNull()).dropDuplicates(["sex_key"]))
+write_dim_current(dim_sex_current, "dim_sex")
+
+# dim_age_current
+dim_age_current = (fact_cur_small
+    .select("age_key").where(F.col("age_key").isNotNull()).dropDuplicates(["age_key"]))
+write_dim_current(dim_age_current, "dim_age")
+
+# dim_indicator_current (name + definition + display_label)
+meta_map = load_indicator_meta_map()
+
+base_inds = (fact_cur_small
+    .select("indicator_id")
+    .where(F.col("indicator_id").isNotNull())
+    .dropDuplicates(["indicator_id"])
+)
+
+if meta_map is not None:
+    dim_indicator_current = (
+        base_inds
+        .join(
+            meta_map.select("indicator_id", "indicator_name", "indicator_definition"),
+            "indicator_id",
+            "left"
+        )
+        .withColumn(
+            "display_label",
+            F.when(F.length(F.trim(F.col("indicator_name"))) > 0, F.col("indicator_name"))
+             .when(F.length(F.trim(F.col("indicator_definition"))) > 0,
+                   F.expr("substring(indicator_definition, 1, 160)"))
+             .otherwise(F.concat(F.lit("Indicator "), F.col("indicator_id").cast("string")))
+        )
+    )
+else:
+    dim_indicator_current = (
+        base_inds
+        .withColumn("indicator_name", F.lit(None).cast("string"))
+        .withColumn("indicator_definition", F.lit(None).cast("string"))
+        .withColumn("display_label",
+            F.concat(F.lit("Indicator "), F.col("indicator_id").cast("string")))
+    )
+
+write_dim_current(dim_indicator_current, "dim_indicator")
+
+
+logger.info("Done (latest-only pipeline).")
